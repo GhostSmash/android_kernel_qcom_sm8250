@@ -12,6 +12,10 @@ on:
       clang_version:
         description: "Версия Clang из apt.llvm.org"
         default: "20"
+      only_ksu:
+        description: "Быстрая проверка: собрать только drivers/kernelsu"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -54,24 +58,27 @@ jobs:
           sudo ./llvm.sh "$CLANG_VERSION"
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
 
-      - name: Show KernelSU hook options (info)
+      - name: Diagnostics for KernelSU compat (to Summary)
         continue-on-error: true
         run: |
-          echo "--- Kconfig: опции хуков ---"
-          grep -n -B1 -A12 -E "config KSU_(SYSCALL_TABLE_HOOK|KPROBES_HOOK|MANUAL_HOOK)" KernelSU/kernel/Kconfig || true
-
-      - name: Show what the device tree uses (info only)
-        continue-on-error: true
-        run: |
-          for b in lineage-24.0 lineage-23.2; do
-            url="https://raw.githubusercontent.com/LineageOS/android_device_xiaomi_sm8250-common/$b/BoardConfigCommon.mk"
-            if curl -fsSL "$url" -o board.mk; then
-              echo "Источник: $b"
-              grep -n "TARGET_KERNEL" board.mk || true
-              break
-            fi
-          done
-          ls arch/arm64/configs/vendor | head -80
+          {
+            echo "### Диагностика: patch_memory.c (строки 1-50)"
+            echo '```c'
+            sed -n '1,50p' KernelSU/kernel/hook/patch_memory.c
+            echo '```'
+            echo "### Где встречается copy_to_kernel_nofault / probe_kernel_write в KernelSU"
+            echo '```'
+            grep -rn -E "copy_to_kernel_nofault|probe_kernel_write" KernelSU/kernel | head -25 || true
+            echo '```'
+            echo "### uaccess.h ядра (строки 290-312)"
+            echo '```c'
+            sed -n '290,312p' include/linux/uaccess.h
+            echo '```'
+            echo "### define-ы в ядре"
+            echo '```'
+            grep -rn -E "define (probe_kernel_write|copy_to_kernel_nofault)" include arch/arm64 | head -10 || echo "нет"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure (defconfig + KernelSU syscall table hook)
         run: |
@@ -84,44 +91,51 @@ jobs:
           grep -E '^(# )?CONFIG_(KSU|KSU_SYSCALL_TABLE_HOOK|KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|KPROBES|MODVERSIONS|MODULES)[ =]' out/.config || true
           grep -q '^CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU не включился"; exit 1; }
           grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config || {
-            echo "CONFIG_KSU_SYSCALL_TABLE_HOOK не включился (смотри зависимости в Kconfig выше)"
+            echo "CONFIG_KSU_SYSCALL_TABLE_HOOK не включился"
             exit 1
           }
 
-      - name: Build Image and DTBs
+      - name: Quick build (only drivers/kernelsu)
+        if: ${{ inputs.only_ksu }}
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_FLAGS prepare 2>&1 | tee build.log
+          make -k -j"$(nproc)" $MAKE_FLAGS drivers/kernelsu/ 2>&1 | tee -a build.log
+
+      - name: Full build (Image and DTBs)
+        if: ${{ !inputs.only_ksu }}
         run: |
           set -o pipefail
           make -j"$(nproc)" $MAKE_FLAGS Image dtbs 2>&1 | tee build.log
 
-      - name: Summary
-        if: success()
+      - name: Summary (quick)
+        if: ${{ success() && inputs.only_ksu }}
+        run: |
+          {
+            echo "### drivers/kernelsu собрался без ошибок"
+            echo "- Hook mode: $(grep -m1 'Hook mode' build.log || echo 'не найдено в логе')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary (full)
+        if: ${{ success() && !inputs.only_ksu }}
         run: |
           {
             echo "### Сборка прошла"
             echo "- Release: $(make -s $MAKE_FLAGS kernelrelease)"
             echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1)"
             echo "- Hook mode: $(grep -m1 'Hook mode' build.log || echo 'не найдено в логе')"
-            echo '```'
-            grep -E '^CONFIG_(KSU|KSU_SYSCALL_TABLE_HOOK)=' out/.config
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show errors
         if: failure()
         run: |
           {
-            echo "### Контекст первой ошибки"
+            echo "### Первые ошибки сборки"
             echo '```'
             if [ -f build.log ]; then
-              n=$(grep -n -m1 -E '\*\*\* \[|error:' build.log | cut -d: -f1)
-              if [ -n "$n" ]; then
-                start=$(( n > 25 ? n - 25 : 1 ))
-                sed -n "${start},$((n+3))p" build.log
-              else
-                tail -n 40 build.log
-              fi
+              grep -n -E 'error:|\*\*\* \[' build.log | head -20 || tail -n 40 build.log
             else
-              echo "build.log нет: ошибка произошла до сборки (смотри шаги выше)"
+              echo "build.log нет: ошибка до сборки (смотри шаги выше)"
             fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
