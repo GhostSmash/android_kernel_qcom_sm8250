@@ -47,30 +47,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zstd \
-            device-tree-compiler python3 coccinelle \
+            device-tree-compiler python3 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh "$CLANG_VERSION"
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
 
-      - name: Apply manual hooks (scope-minimized, Coccinelle)
-        run: |
-          set -e
-          git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle /tmp/ksu-cocci
-          cd /tmp/ksu-cocci/scope-minimized-hooks
-          chmod +x apply.sh
-          ./apply.sh "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          echo "--- Изменённые файлы ---"
-          git status --short | grep -v '^?? ' | head -30 || true
-          git diff -- fs kernel drivers/input security > hooks.patch || true
-          git diff --stat -- fs kernel drivers/input security | tail -15 || true
-
-      - name: Show KernelSU hook check (info)
+      - name: Show KernelSU hook options (info)
         continue-on-error: true
         run: |
-          grep -n -i "hook" KernelSU/kernel/Kbuild | head -40 || true
+          echo "--- Kconfig: опции хуков ---"
+          grep -n -B1 -A12 -E "config KSU_(SYSCALL_TABLE_HOOK|KPROBES_HOOK|MANUAL_HOOK)" KernelSU/kernel/Kconfig || true
 
       - name: Show what the device tree uses (info only)
         continue-on-error: true
@@ -85,20 +73,20 @@ jobs:
           done
           ls arch/arm64/configs/vendor | head -80
 
-      - name: Configure (defconfig + KernelSU manual hooks)
+      - name: Configure (defconfig + KernelSU syscall table hook)
         run: |
           set -e
           clang --version | head -n1
           make $MAKE_FLAGS $DEFCONFIGS
-          scripts/config --file out/.config -e KSU -e KSU_MANUAL_HOOK -d KPROBES -d KPROBE_EVENTS
+          scripts/config --file out/.config -e KSU -e KSU_SYSCALL_TABLE_HOOK -d KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK
           make $MAKE_FLAGS olddefconfig
           echo "--- Итоговые опции ---"
-          grep -E '^(# )?CONFIG_(KSU|KSU_MANUAL_HOOK|KPROBES|KPROBE_EVENTS|MODVERSIONS|MODULES)[ =]' out/.config || true
+          grep -E '^(# )?CONFIG_(KSU|KSU_SYSCALL_TABLE_HOOK|KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|KPROBES|MODVERSIONS|MODULES)[ =]' out/.config || true
           grep -q '^CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU не включился"; exit 1; }
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "CONFIG_KSU_MANUAL_HOOK не включился"; exit 1; }
-          if grep -q '^CONFIG_KPROBES=y' out/.config; then
-            echo "ВНИМАНИЕ: KPROBES снова включился (его кто-то выбирает через select)"
-          fi
+          grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config || {
+            echo "CONFIG_KSU_SYSCALL_TABLE_HOOK не включился (смотри зависимости в Kconfig выше)"
+            exit 1
+          }
 
       - name: Build Image and DTBs
         run: |
@@ -112,8 +100,9 @@ jobs:
             echo "### Сборка прошла"
             echo "- Release: $(make -s $MAKE_FLAGS kernelrelease)"
             echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+            echo "- Hook mode: $(grep -m1 'Hook mode' build.log || echo 'не найдено в логе')"
             echo '```'
-            grep -E '^CONFIG_(KSU|KSU_MANUAL_HOOK|KPROBES)=' out/.config
+            grep -E '^CONFIG_(KSU|KSU_SYSCALL_TABLE_HOOK)=' out/.config
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -145,7 +134,6 @@ jobs:
           if-no-files-found: warn
           path: |
             build.log
-            hooks.patch
             out/.config
             out/arch/arm64/boot/Image
             out/arch/arm64/boot/dts/**/*.dtb
