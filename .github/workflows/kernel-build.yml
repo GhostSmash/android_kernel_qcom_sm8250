@@ -9,10 +9,6 @@ on:
       defconfigs:
         description: "Defconfig и фрагменты через пробел"
         default: "vendor/kona-perf_defconfig"
-      use_kprobes:
-        description: "Включить kprobes (true) или выключить (false, для manual hooks)"
-        type: boolean
-        default: true
       clang_version:
         description: "Версия Clang из apt.llvm.org"
         default: "20"
@@ -22,7 +18,6 @@ permissions:
 
 env:
   DEFCONFIGS: ${{ inputs.defconfigs }}
-  USE_KPROBES: ${{ inputs.use_kprobes }}
   CLANG_VERSION: ${{ inputs.clang_version }}
   MAKE_FLAGS: >-
     O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
@@ -33,7 +28,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout kernel with submodules
@@ -52,11 +47,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zstd \
-            device-tree-compiler python3 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+            device-tree-compiler python3 coccinelle \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh "$CLANG_VERSION"
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Apply manual hooks (scope-minimized, Coccinelle)
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle /tmp/ksu-cocci
+          cd /tmp/ksu-cocci/scope-minimized-hooks
+          chmod +x apply.sh
+          ./apply.sh "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          echo "--- Изменённые файлы ---"
+          git status --short | grep -v '^?? ' | head -30 || true
+          git diff -- fs kernel drivers/input security > hooks.patch || true
+          git diff --stat -- fs kernel drivers/input security | tail -15 || true
+
+      - name: Show KernelSU hook check (info)
+        continue-on-error: true
+        run: |
+          grep -n -i "hook" KernelSU/kernel/Kbuild | head -40 || true
 
       - name: Show what the device tree uses (info only)
         continue-on-error: true
@@ -69,24 +83,22 @@ jobs:
               break
             fi
           done
-          echo "Конфиги в дереве ядра:"
           ls arch/arm64/configs/vendor | head -80
 
-      - name: Configure (defconfig + KernelSU)
+      - name: Configure (defconfig + KernelSU manual hooks)
         run: |
           set -e
           clang --version | head -n1
           make $MAKE_FLAGS $DEFCONFIGS
-          scripts/config --file out/.config -e KSU
-          if [ "$USE_KPROBES" = "true" ]; then
-            scripts/config --file out/.config -e KPROBES -e KPROBE_EVENTS
-          else
-            scripts/config --file out/.config -d KPROBES
-          fi
+          scripts/config --file out/.config -e KSU -e KSU_MANUAL_HOOK -d KPROBES -d KPROBE_EVENTS
           make $MAKE_FLAGS olddefconfig
           echo "--- Итоговые опции ---"
-          grep -E '^(# )?CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS|MODVERSIONS|MODULES)[ =]' out/.config || true
-          grep -q '^CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU не включился (зависимости?)"; exit 1; }
+          grep -E '^(# )?CONFIG_(KSU|KSU_MANUAL_HOOK|KPROBES|KPROBE_EVENTS|MODVERSIONS|MODULES)[ =]' out/.config || true
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU не включился"; exit 1; }
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "CONFIG_KSU_MANUAL_HOOK не включился"; exit 1; }
+          if grep -q '^CONFIG_KPROBES=y' out/.config; then
+            echo "ВНИМАНИЕ: KPROBES снова включился (его кто-то выбирает через select)"
+          fi
 
       - name: Build Image and DTBs
         run: |
@@ -101,7 +113,7 @@ jobs:
             echo "- Release: $(make -s $MAKE_FLAGS kernelrelease)"
             echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1)"
             echo '```'
-            grep -E '^CONFIG_(KSU|KPROBES)=' out/.config
+            grep -E '^CONFIG_(KSU|KSU_MANUAL_HOOK|KPROBES)=' out/.config
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -109,9 +121,19 @@ jobs:
         if: failure()
         run: |
           {
-            echo "### Ошибки сборки"
+            echo "### Контекст первой ошибки"
             echo '```'
-            grep -nE "error:|Error [0-9]|undefined reference|No rule to make" build.log | head -40 || echo "см. build.log в артефактах"
+            if [ -f build.log ]; then
+              n=$(grep -n -m1 -E '\*\*\* \[|error:' build.log | cut -d: -f1)
+              if [ -n "$n" ]; then
+                start=$(( n > 25 ? n - 25 : 1 ))
+                sed -n "${start},$((n+3))p" build.log
+              else
+                tail -n 40 build.log
+              fi
+            else
+              echo "build.log нет: ошибка произошла до сборки (смотри шаги выше)"
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -123,6 +145,7 @@ jobs:
           if-no-files-found: warn
           path: |
             build.log
+            hooks.patch
             out/.config
             out/arch/arm64/boot/Image
             out/arch/arm64/boot/dts/**/*.dtb
