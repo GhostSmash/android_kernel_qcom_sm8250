@@ -62,11 +62,67 @@ jobs:
         run: |
           set -e
           f=KernelSU/kernel/hook/patch_memory.c
-          # в ядре уже есть copy_to_kernel_nofault, свой макрос KernelSU не нужен
           grep -q 'copy_to_kernel_nofault' include/linux/uaccess.h
           sed -i '1,25s/^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)/#if 0/' "$f"
           grep -q '^#if 0' "$f" || { echo "правка не применилась"; exit 1; }
-          sed -n '8,20p' "$f"
+
+      - name: Backport path_umount (fs/namespace.c)
+        run: |
+          set -e
+          python3 - <<'PY'
+          import sys
+          p = "fs/namespace.c"
+          s = open(p).read()
+          if "int path_umount(" in s:
+              print("path_umount уже есть, пропускаю")
+              sys.exit(0)
+          marker = "SYSCALL_DEFINE2(umount, char __user *, name, int, flags)"
+          i = s.find(marker)
+          if i == -1:
+              print("не найден SYSCALL_DEFINE2(umount ...)")
+              sys.exit(1)
+          code = '''static int ksu_can_umount(const struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+
+          	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+          		return -EINVAL;
+          	if (!may_mount())
+          		return -EPERM;
+          	if (path->dentry != path->mnt->mnt_root)
+          		return -EINVAL;
+          	if (!check_mnt(mnt))
+          		return -EINVAL;
+          	if (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
+          		return -EINVAL;
+          	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+          		return -EPERM;
+          	return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+          	int ret;
+
+          	ret = ksu_can_umount(path, flags);
+          	if (!ret)
+          		ret = do_umount(mnt, flags);
+
+          	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
+          	dput(path->dentry);
+          	mntput_no_expire(mnt);
+          	return ret;
+          }
+
+          '''
+          # убираем отступ YAML (10 пробелов) из вставляемого кода
+          code = "\n".join(l[10:] if l.startswith(" " * 10) else l for l in code.split("\n"))
+          s = s[:i] + code + s[i:]
+          open(p, "w").write(s)
+          print("path_umount добавлен")
+          PY
+          grep -n "int path_umount" fs/namespace.c
 
       - name: Configure (defconfig + KernelSU syscall table hook)
         run: |
@@ -89,7 +145,6 @@ jobs:
           make -j"$(nproc)" $MAKE_FLAGS prepare scripts 2>&1 | tee build.log
           make -j"$(nproc)" $MAKE_FLAGS security/selinux/flask.h 2>&1 | tee -a build.log \
             || make -j"$(nproc)" $MAKE_FLAGS security/selinux/ 2>&1 | tee -a build.log
-          ls out/security/selinux/ | head
 
       - name: Quick build (only drivers/kernelsu)
         if: ${{ inputs.only_ksu }}
@@ -128,7 +183,7 @@ jobs:
             echo "### Первые ошибки сборки"
             echo '```'
             if [ -f build.log ]; then
-              grep -n -E 'error:|\*\*\* \[|undefined reference' build.log | head -20 || tail -n 40 build.log
+              grep -n -E 'error:|\*\*\* \[|undefined (reference|symbol)' build.log | head -20 || tail -n 40 build.log
             else
               echo "build.log нет: ошибка до сборки (смотри шаги выше)"
             fi
