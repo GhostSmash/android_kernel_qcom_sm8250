@@ -1,0 +1,128 @@
+name: Kernel build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Ветка форка для сборки"
+        default: "ksu-next"
+      defconfigs:
+        description: "Defconfig и фрагменты через пробел"
+        default: "vendor/kona-perf_defconfig"
+      use_kprobes:
+        description: "Включить kprobes (true) или выключить (false, для manual hooks)"
+        type: boolean
+        default: true
+      clang_version:
+        description: "Версия Clang из apt.llvm.org"
+        default: "20"
+
+permissions:
+  contents: read
+
+env:
+  DEFCONFIGS: ${{ inputs.defconfigs }}
+  USE_KPROBES: ${{ inputs.use_kprobes }}
+  CLANG_VERSION: ${{ inputs.clang_version }}
+  MAKE_FLAGS: >-
+    O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+    OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+    CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi- KCFLAGS=-Wno-error
+    KBUILD_BUILD_USER=ghost KBUILD_BUILD_HOST=actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout kernel with submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Deepen KernelSU history (for version number)
+        run: |
+          git -C KernelSU fetch --tags --unshallow || git -C KernelSU fetch --tags --depth=500 || true
+          echo "KernelSU commits: $(git -C KernelSU rev-list --count HEAD)"
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zstd \
+            device-tree-compiler python3 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$CLANG_VERSION"
+          echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Show what the device tree uses (info only)
+        continue-on-error: true
+        run: |
+          for b in lineage-24.0 lineage-23.2; do
+            url="https://raw.githubusercontent.com/LineageOS/android_device_xiaomi_sm8250-common/$b/BoardConfigCommon.mk"
+            if curl -fsSL "$url" -o board.mk; then
+              echo "Источник: $b"
+              grep -n "TARGET_KERNEL" board.mk || true
+              break
+            fi
+          done
+          echo "Конфиги в дереве ядра:"
+          ls arch/arm64/configs/vendor | head -80
+
+      - name: Configure (defconfig + KernelSU)
+        run: |
+          set -e
+          clang --version | head -n1
+          make $MAKE_FLAGS $DEFCONFIGS
+          scripts/config --file out/.config -e KSU
+          if [ "$USE_KPROBES" = "true" ]; then
+            scripts/config --file out/.config -e KPROBES -e KPROBE_EVENTS
+          else
+            scripts/config --file out/.config -d KPROBES
+          fi
+          make $MAKE_FLAGS olddefconfig
+          echo "--- Итоговые опции ---"
+          grep -E '^(# )?CONFIG_(KSU|KPROBES|HAVE_KPROBES|KPROBE_EVENTS|MODVERSIONS|MODULES)[ =]' out/.config || true
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU не включился (зависимости?)"; exit 1; }
+
+      - name: Build Image and DTBs
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_FLAGS Image dtbs 2>&1 | tee build.log
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### Сборка прошла"
+            echo "- Release: $(make -s $MAKE_FLAGS kernelrelease)"
+            echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+            echo '```'
+            grep -E '^CONFIG_(KSU|KPROBES)=' out/.config
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show errors
+        if: failure()
+        run: |
+          {
+            echo "### Ошибки сборки"
+            echo '```'
+            grep -nE "error:|Error [0-9]|undefined reference|No rule to make" build.log | head -40 || echo "см. build.log в артефактах"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-out
+          if-no-files-found: warn
+          path: |
+            build.log
+            out/.config
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/dts/**/*.dtb
