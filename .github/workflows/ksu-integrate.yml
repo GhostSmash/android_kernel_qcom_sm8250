@@ -1,0 +1,94 @@
+name: KSU integrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Ветка форка, куда коммитим"
+        default: "ksu-next"
+      ksu_repo:
+        description: "Репозиторий KernelSU"
+        default: "https://github.com/KernelSU-Next/KernelSU-Next"
+      ksu_branch:
+        description: "Ветка KernelSU (для 4.19 нужна legacy)"
+        default: "legacy"
+
+permissions:
+  contents: write
+
+env:
+  TARGET_BRANCH: ${{ inputs.target_branch }}
+  KSU_REPO: ${{ inputs.ksu_repo }}
+  KSU_BRANCH: ${{ inputs.ksu_branch }}
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 1
+
+      - name: Check KernelSU branch exists
+        run: |
+          if ! git ls-remote --exit-code --heads "$KSU_REPO" "$KSU_BRANCH"; then
+            echo "Ветка '$KSU_BRANCH' не найдена в $KSU_REPO. Доступные ветки:"
+            git ls-remote --heads "$KSU_REPO" | sed 's#.*refs/heads/##'
+            exit 1
+          fi
+
+      - name: Add KernelSU as submodule
+        run: |
+          set -e
+          if ! git config -f .gitmodules --get submodule.KernelSU.url >/dev/null 2>&1; then
+            git submodule add -b "$KSU_BRANCH" "$KSU_REPO" KernelSU
+          fi
+          test -f KernelSU/kernel/Kconfig
+
+      - name: Link KernelSU into drivers
+        run: |
+          set -e
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q kernelsu drivers/Kconfig || printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+
+      - name: Enable CONFIG_KSU in alioth defconfig
+        run: |
+          DEF=$(find arch/arm64/configs -name 'alioth*defconfig' | head -n1)
+          if [ -z "$DEF" ]; then
+            echo "alioth defconfig не найден. Что есть в configs:"
+            ls arch/arm64/configs | head -50
+            ls arch/arm64/configs/vendor 2>/dev/null | head -50
+          else
+            grep -q '^CONFIG_KSU=y' "$DEF" || printf '\nCONFIG_KSU=y\n' >> "$DEF"
+          fi
+          echo "DEFCONFIG=$DEF" >> "$GITHUB_ENV"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Результат"
+            echo "- Версия ядра: $(grep -m3 -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | awk '{print $3}' | paste -sd.)"
+            echo "- KernelSU: $KSU_REPO @ $KSU_BRANCH"
+            echo "- Defconfig: ${DEFCONFIG:-не найден}"
+            if [ -n "$DEFCONFIG" ]; then
+              echo "- KSU/KPROBES в defconfig:"
+              echo '```'
+              grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_HAVE_KPROBES|CONFIG_KPROBE_EVENTS' "$DEFCONFIG" || echo "(ничего не найдено)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Нечего коммитить"
+          else
+            git commit -m "Add KernelSU ($KSU_BRANCH) integration"
+            git push origin HEAD:"$TARGET_BRANCH"
+          fi
