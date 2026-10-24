@@ -58,27 +58,15 @@ jobs:
           sudo ./llvm.sh "$CLANG_VERSION"
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
 
-      - name: Diagnostics for KernelSU compat (to Summary)
-        continue-on-error: true
+      - name: Patch KernelSU compat (copy_to_kernel_nofault)
         run: |
-          {
-            echo "### Диагностика: patch_memory.c (строки 1-50)"
-            echo '```c'
-            sed -n '1,50p' KernelSU/kernel/hook/patch_memory.c
-            echo '```'
-            echo "### Где встречается copy_to_kernel_nofault / probe_kernel_write в KernelSU"
-            echo '```'
-            grep -rn -E "copy_to_kernel_nofault|probe_kernel_write" KernelSU/kernel | head -25 || true
-            echo '```'
-            echo "### uaccess.h ядра (строки 290-312)"
-            echo '```c'
-            sed -n '290,312p' include/linux/uaccess.h
-            echo '```'
-            echo "### define-ы в ядре"
-            echo '```'
-            grep -rn -E "define (probe_kernel_write|copy_to_kernel_nofault)" include arch/arm64 | head -10 || echo "нет"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -e
+          f=KernelSU/kernel/hook/patch_memory.c
+          # в ядре уже есть copy_to_kernel_nofault, свой макрос KernelSU не нужен
+          grep -q 'copy_to_kernel_nofault' include/linux/uaccess.h
+          sed -i '1,25s/^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)/#if 0/' "$f"
+          grep -q '^#if 0' "$f" || { echo "правка не применилась"; exit 1; }
+          sed -n '8,20p' "$f"
 
       - name: Configure (defconfig + KernelSU syscall table hook)
         run: |
@@ -95,18 +83,25 @@ jobs:
             exit 1
           }
 
+      - name: Pre-generate headers (prepare, scripts, SELinux flask.h)
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_FLAGS prepare scripts 2>&1 | tee build.log
+          make -j"$(nproc)" $MAKE_FLAGS security/selinux/flask.h 2>&1 | tee -a build.log \
+            || make -j"$(nproc)" $MAKE_FLAGS security/selinux/ 2>&1 | tee -a build.log
+          ls out/security/selinux/ | head
+
       - name: Quick build (only drivers/kernelsu)
         if: ${{ inputs.only_ksu }}
         run: |
           set -o pipefail
-          make -j"$(nproc)" $MAKE_FLAGS prepare 2>&1 | tee build.log
           make -k -j"$(nproc)" $MAKE_FLAGS drivers/kernelsu/ 2>&1 | tee -a build.log
 
       - name: Full build (Image and DTBs)
         if: ${{ !inputs.only_ksu }}
         run: |
           set -o pipefail
-          make -j"$(nproc)" $MAKE_FLAGS Image dtbs 2>&1 | tee build.log
+          make -j"$(nproc)" $MAKE_FLAGS Image dtbs 2>&1 | tee -a build.log
 
       - name: Summary (quick)
         if: ${{ success() && inputs.only_ksu }}
@@ -133,7 +128,7 @@ jobs:
             echo "### Первые ошибки сборки"
             echo '```'
             if [ -f build.log ]; then
-              grep -n -E 'error:|\*\*\* \[' build.log | head -20 || tail -n 40 build.log
+              grep -n -E 'error:|\*\*\* \[|undefined reference' build.log | head -20 || tail -n 40 build.log
             else
               echo "build.log нет: ошибка до сборки (смотри шаги выше)"
             fi
