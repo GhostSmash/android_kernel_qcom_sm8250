@@ -16,6 +16,9 @@ on:
         description: "Быстрая проверка: собрать только drivers/kernelsu"
         type: boolean
         default: true
+      stock_boot_url:
+        description: "Ссылка на стоковый boot.img (для сборки boot_ksu.img)"
+        default: ""
 
 permissions:
   contents: read
@@ -116,7 +119,6 @@ jobs:
           }
 
           '''
-          # убираем отступ YAML (10 пробелов) из вставляемого кода
           code = "\n".join(l[10:] if l.startswith(" " * 10) else l for l in code.split("\n"))
           s = s[:i] + code + s[i:]
           open(p, "w").write(s)
@@ -158,6 +160,58 @@ jobs:
           set -o pipefail
           make -j"$(nproc)" $MAKE_FLAGS Image dtbs 2>&1 | tee -a build.log
 
+      - name: Make boot.img (repack stock boot with our kernel)
+        if: ${{ !inputs.only_ksu && inputs.stock_boot_url != '' }}
+        env:
+          STOCK_BOOT_URL: ${{ inputs.stock_boot_url }}
+        run: |
+          set -e
+          mkdir -p work
+          cd work
+          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+          git clone -q --depth=1 https://android.googlesource.com/platform/external/avb avb
+          curl -fL "$STOCK_BOOT_URL" -o stock_boot.img
+          ls -l stock_boot.img
+
+          echo "=== Параметры стокового boot.img ==="
+          python3 mkbootimg/unpack_bootimg.py --boot_img stock_boot.img --out unpacked | tee boot_info.txt
+          python3 mkbootimg/unpack_bootimg.py --boot_img stock_boot.img --out unpacked --format=mkbootimg > mkargs.txt
+          echo "mkbootimg args: $(cat mkargs.txt)"
+
+          kmagic=$(od -An -tx1 -N4 unpacked/kernel | tr -d ' \n')
+          echo "Магия ядра в стоке: $kmagic"
+          case "$kmagic" in
+            1f8b*)    kfmt=gzip; zcat unpacked/kernel > stock_Image ;;
+            02214c18) kfmt=lz4l; lz4 -dc unpacked/kernel > stock_Image ;;
+            04224d18) kfmt=lz4;  lz4 -dc unpacked/kernel > stock_Image ;;
+            *)        kfmt=raw;  cp unpacked/kernel stock_Image ;;
+          esac
+          NEW=../out/arch/arm64/boot/Image
+          echo "Стоковое ядро: $(strings -n 20 stock_Image | grep -m1 'Linux version 4' || echo не найдено)"
+          echo "Наше ядро:     $(strings -n 20 $NEW | grep -m1 'Linux version 4' || echo не найдено)"
+
+          case "$kfmt" in
+            gzip) gzip -9 -c "$NEW" > unpacked/kernel ;;
+            lz4l) lz4 -l -12 -c "$NEW" > unpacked/kernel ;;
+            lz4)  lz4 -12 -c "$NEW" > unpacked/kernel ;;
+            raw)  cp "$NEW" unpacked/kernel ;;
+          esac
+
+          eval "python3 mkbootimg/mkbootimg.py $(cat mkargs.txt) -o boot_ksu.img"
+
+          echo "=== AVB footer ==="
+          if python3 avb/avbtool.py info_image --image stock_boot.img > avb_info.txt 2>&1; then
+            cat avb_info.txt
+            PSIZE=$(grep -m1 '^Image size:' avb_info.txt | awk '{print $3}')
+            echo "Размер раздела: $PSIZE"
+            python3 avb/avbtool.py add_hash_footer --image boot_ksu.img \
+              --partition_size "$PSIZE" --partition_name boot
+          else
+            echo "У стокового boot.img нет AVB-футера, пропускаю"
+          fi
+          ls -l boot_ksu.img
+          sha256sum boot_ksu.img
+
       - name: Summary (quick)
         if: ${{ success() && inputs.only_ksu }}
         run: |
@@ -174,6 +228,12 @@ jobs:
             echo "- Release: $(make -s $MAKE_FLAGS kernelrelease)"
             echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1)"
             echo "- Hook mode: $(grep -m1 'Hook mode' build.log || echo 'не найдено в логе')"
+            if [ -f work/boot_ksu.img ]; then
+              echo "- boot_ksu.img: $(du -h work/boot_ksu.img | cut -f1)"
+              echo '```'
+              head -n 20 work/boot_info.txt
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show errors
@@ -196,8 +256,12 @@ jobs:
         with:
           name: kernel-out
           if-no-files-found: warn
+          include-hidden-files: true
           path: |
             build.log
             out/.config
             out/arch/arm64/boot/Image
             out/arch/arm64/boot/dts/**/*.dtb
+            work/boot_ksu.img
+            work/boot_info.txt
+            work/avb_info.txt
