@@ -3,11 +3,14 @@ name: Kernel build
 on:
   workflow_dispatch:
     inputs:
-      target_branch:
-        description: "Ветка форка для сборки"
-        default: "ksu-next"
+      kernel_repo:
+        description: "Репозиторий с исходниками ядра"
+        default: "LineageOS/android_kernel_qcom_sm8250"
+      kernel_ref:
+        description: "Коммит или ветка (коммит прошивки: c4c39705984f)"
+        default: "c4c39705984f"
       defconfigs:
-        description: "Defconfig и фрагменты через пробел"
+        description: "Запасной defconfig, если в стоке нет конфига"
         default: "vendor/kona-perf_defconfig"
       clang_version:
         description: "Версия Clang из apt.llvm.org"
@@ -17,15 +20,21 @@ on:
         type: boolean
         default: true
       stock_boot_url:
-        description: "Ссылка на стоковый boot.img (для сборки boot_ksu.img)"
-        default: ""
+        description: "Ссылка на стоковый boot.img"
+        default: "https://github.com/GhostSmash/android_kernel_qcom_sm8250/releases/download/stock-boot/boot.img"
 
 permissions:
   contents: read
 
 env:
+  KERNEL_REPO: ${{ inputs.kernel_repo }}
+  KERNEL_REF: ${{ inputs.kernel_ref }}
   DEFCONFIGS: ${{ inputs.defconfigs }}
   CLANG_VERSION: ${{ inputs.clang_version }}
+  STOCK_BOOT_URL: ${{ inputs.stock_boot_url }}
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next
+  KSU_BRANCH: legacy
+  KSU_REF: 0b17f24
   MAKE_FLAGS: >-
     O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
     OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
@@ -38,28 +47,44 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - name: Checkout kernel with submodules
+      - name: Resolve kernel commit
+        id: sha
+        run: |
+          set -e
+          sha=$(curl -fsSL "https://api.github.com/repos/$KERNEL_REPO/commits/$KERNEL_REF" | jq -r .sha)
+          echo "Коммит ядра: $sha"
+          test -n "$sha" && [ "$sha" != "null" ]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout kernel
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.target_branch }}
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ steps.sha.outputs.sha }}
           fetch-depth: 1
-          submodules: recursive
-
-      - name: Deepen KernelSU history (for version number)
-        run: |
-          git -C KernelSU fetch --tags --unshallow || git -C KernelSU fetch --tags --depth=500 || true
-          echo "KernelSU commits: $(git -C KernelSU rev-list --count HEAD)"
 
       - name: Install toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio lz4 zstd \
-            device-tree-compiler python3 \
+            device-tree-compiler python3 jq \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh "$CLANG_VERSION"
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Integrate KernelSU Next
+        run: |
+          set -e
+          git ls-remote --exit-code --heads "$KSU_REPO" "$KSU_BRANCH"
+          git clone --branch "$KSU_BRANCH" "$KSU_REPO" KernelSU
+          git -C KernelSU checkout "$KSU_REF"
+          echo "KernelSU commits: $(git -C KernelSU rev-list --count HEAD)"
+          test -f KernelSU/kernel/Kconfig
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q kernelsu drivers/Kconfig || printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
 
       - name: Patch KernelSU compat (copy_to_kernel_nofault)
         run: |
@@ -126,20 +151,79 @@ jobs:
           PY
           grep -n "int path_umount" fs/namespace.c
 
-      - name: Configure (defconfig + KernelSU syscall table hook)
+      - name: Fetch stock boot.img, read kernel release and config
+        if: ${{ inputs.stock_boot_url != '' }}
+        run: |
+          set -e
+          mkdir -p work
+          cd work
+          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+          git clone -q --depth=1 https://android.googlesource.com/platform/external/avb avb
+          curl -fL "$STOCK_BOOT_URL" -o stock_boot.img
+          ls -l stock_boot.img
+
+          echo "=== Параметры стокового boot.img ==="
+          python3 mkbootimg/unpack_bootimg.py --boot_img stock_boot.img --out unpacked | tee boot_info.txt
+          python3 mkbootimg/unpack_bootimg.py --boot_img stock_boot.img --out unpacked --format=mkbootimg > mkargs.txt
+          echo "mkbootimg args: $(cat mkargs.txt)"
+
+          kmagic=$(od -An -tx1 -N4 unpacked/kernel | tr -d ' \n')
+          case "$kmagic" in
+            1f8b*)    kfmt=gzip; zcat unpacked/kernel > stock_Image ;;
+            02214c18) kfmt=lz4l; lz4 -dc unpacked/kernel > stock_Image ;;
+            04224d18) kfmt=lz4;  lz4 -dc unpacked/kernel > stock_Image ;;
+            *)        kfmt=raw;  cp unpacked/kernel stock_Image ;;
+          esac
+          echo "kfmt=$kfmt" > kfmt.txt
+          echo "Формат ядра в стоке: $kfmt ($kmagic)"
+
+          stock_rel=$(strings -n 20 stock_Image | grep -m1 -o 'Linux version 4[^ ]*' | awk '{print $3}' || true)
+          echo "Стоковый release: $stock_rel"
+          echo "STOCK_REL=$stock_rel" >> "$GITHUB_ENV"
+
+          python3 - <<'PY' || echo "Конфиг в стоковом ядре не найден, возьму defconfig"
+          import sys, zlib
+          d = open("stock_Image", "rb").read()
+          i = d.find(b"IKCFG_ST")
+          if i < 0:
+              sys.exit(3)
+          out = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(d[i + 8:])
+          open("stock_config", "wb").write(out)
+          print("Конфиг стокового ядра извлечён, строк:", out.count(b"\n"))
+          PY
+          ls -l
+
+      - name: Configure (stock config or defconfig, plus KernelSU)
         run: |
           set -e
           clang --version | head -n1
-          make $MAKE_FLAGS $DEFCONFIGS
+          mkdir -p out
+          if [ -s work/stock_config ]; then
+            echo "Беру конфиг из стокового ядра"
+            cp work/stock_config out/.config
+            make $MAKE_FLAGS olddefconfig
+          else
+            echo "Беру defconfig: $DEFCONFIGS"
+            make $MAKE_FLAGS $DEFCONFIGS
+          fi
           scripts/config --file out/.config -e KSU -e KSU_SYSCALL_TABLE_HOOK -d KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK
+          if [ -n "$STOCK_REL" ]; then
+            kv=$(make -s $MAKE_FLAGS kernelversion)
+            suffix="${STOCK_REL#"$kv"}"
+            if [ "$suffix" != "$STOCK_REL" ]; then
+              echo "kernelversion=$kv, суффикс для LOCALVERSION: $suffix"
+              scripts/config --file out/.config -d LOCALVERSION_AUTO --set-str LOCALVERSION "$suffix"
+            else
+              echo "ВНИМАНИЕ: стоковый release ($STOCK_REL) не начинается с $kv, строку версии не трогаю"
+            fi
+          fi
           make $MAKE_FLAGS olddefconfig
           echo "--- Итоговые опции ---"
-          grep -E '^(# )?CONFIG_(KSU|KSU_SYSCALL_TABLE_HOOK|KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|KPROBES|MODVERSIONS|MODULES)[ =]' out/.config || true
+          grep -E '^(# )?CONFIG_(KSU|KSU_SYSCALL_TABLE_HOOK|KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|KPROBES|MODVERSIONS|MODULES|LOCALVERSION|LOCALVERSION_AUTO|LTO_CLANG|CFI_CLANG)[ =]' out/.config || true
+          echo "Наш release: $(make -s $MAKE_FLAGS kernelrelease)"
+          echo "Стоковый:    $STOCK_REL"
           grep -q '^CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU не включился"; exit 1; }
-          grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config || {
-            echo "CONFIG_KSU_SYSCALL_TABLE_HOOK не включился"
-            exit 1
-          }
+          grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config || { echo "CONFIG_KSU_SYSCALL_TABLE_HOOK не включился"; exit 1; }
 
       - name: Pre-generate headers (prepare, scripts, SELinux flask.h)
         run: |
@@ -162,33 +246,14 @@ jobs:
 
       - name: Make boot.img (repack stock boot with our kernel)
         if: ${{ !inputs.only_ksu && inputs.stock_boot_url != '' }}
-        env:
-          STOCK_BOOT_URL: ${{ inputs.stock_boot_url }}
         run: |
           set -e
-          mkdir -p work
           cd work
-          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
-          git clone -q --depth=1 https://android.googlesource.com/platform/external/avb avb
-          curl -fL "$STOCK_BOOT_URL" -o stock_boot.img
-          ls -l stock_boot.img
-
-          echo "=== Параметры стокового boot.img ==="
-          python3 mkbootimg/unpack_bootimg.py --boot_img stock_boot.img --out unpacked | tee boot_info.txt
-          python3 mkbootimg/unpack_bootimg.py --boot_img stock_boot.img --out unpacked --format=mkbootimg > mkargs.txt
-          echo "mkbootimg args: $(cat mkargs.txt)"
-
-          kmagic=$(od -An -tx1 -N4 unpacked/kernel | tr -d ' \n')
-          echo "Магия ядра в стоке: $kmagic"
-          case "$kmagic" in
-            1f8b*)    kfmt=gzip; zcat unpacked/kernel > stock_Image ;;
-            02214c18) kfmt=lz4l; lz4 -dc unpacked/kernel > stock_Image ;;
-            04224d18) kfmt=lz4;  lz4 -dc unpacked/kernel > stock_Image ;;
-            *)        kfmt=raw;  cp unpacked/kernel stock_Image ;;
-          esac
+          . ./kfmt.txt
           NEW=../out/arch/arm64/boot/Image
           echo "Стоковое ядро: $(strings -n 20 stock_Image | grep -m1 'Linux version 4' || echo не найдено)"
           echo "Наше ядро:     $(strings -n 20 $NEW | grep -m1 'Linux version 4' || echo не найдено)"
+          echo "Размер: сток $(stat -c %s stock_Image), наш $(stat -c %s $NEW)"
 
           case "$kfmt" in
             gzip) gzip -9 -c "$NEW" > unpacked/kernel ;;
@@ -203,7 +268,6 @@ jobs:
           if python3 avb/avbtool.py info_image --image stock_boot.img > avb_info.txt 2>&1; then
             cat avb_info.txt
             PSIZE=$(grep -m1 '^Image size:' avb_info.txt | awk '{print $3}')
-            echo "Размер раздела: $PSIZE"
             python3 avb/avbtool.py add_hash_footer --image boot_ksu.img \
               --partition_size "$PSIZE" --partition_name boot
           else
@@ -225,15 +289,13 @@ jobs:
         run: |
           {
             echo "### Сборка прошла"
-            echo "- Release: $(make -s $MAKE_FLAGS kernelrelease)"
-            echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+            echo "- Коммит ядра: ${{ steps.sha.outputs.sha }}"
+            echo "- Release (наш):    $(make -s $MAKE_FLAGS kernelrelease)"
+            echo "- Release (стоковый): ${STOCK_REL:-нет данных}"
+            echo "- Конфиг: $([ -s work/stock_config ] && echo 'из стокового ядра' || echo 'defconfig')"
+            echo "- Image: $(du -h out/arch/arm64/boot/Image | cut -f1) (сток: $(du -h work/stock_Image 2>/dev/null | cut -f1))"
             echo "- Hook mode: $(grep -m1 'Hook mode' build.log || echo 'не найдено в логе')"
-            if [ -f work/boot_ksu.img ]; then
-              echo "- boot_ksu.img: $(du -h work/boot_ksu.img | cut -f1)"
-              echo '```'
-              head -n 20 work/boot_info.txt
-              echo '```'
-            fi
+            [ -f work/boot_ksu.img ] && echo "- boot_ksu.img: $(du -h work/boot_ksu.img | cut -f1)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show errors
@@ -265,3 +327,4 @@ jobs:
             work/boot_ksu.img
             work/boot_info.txt
             work/avb_info.txt
+            work/stock_config
