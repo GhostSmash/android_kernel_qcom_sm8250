@@ -5,7 +5,7 @@ on:
     inputs:
       kernel_repo:
         description: "Репозиторий с исходниками ядра"
-        default: "LineageOS/android_kernel_qcom_sm8250"
+        default: "LineageOS/android_kernel_xiaomi_sm8250"
       kernel_ref:
         description: "Коммит или ветка (коммит прошивки: c4c39705984f)"
         default: "c4c39705984f"
@@ -50,10 +50,9 @@ jobs:
       - name: Resolve kernel commit
         id: sha
         run: |
-          set -e
-          sha=$(curl -fsSL "https://api.github.com/repos/$KERNEL_REPO/commits/$KERNEL_REF" | jq -r .sha)
+          set -euo pipefail
+          sha=$(curl -fsSL "https://api.github.com/repos/$KERNEL_REPO/commits/$KERNEL_REF" | jq -er .sha)
           echo "Коммит ядра: $sha"
-          test -n "$sha" && [ "$sha" != "null" ]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout kernel
@@ -192,6 +191,16 @@ jobs:
           print("Конфиг стокового ядра извлечён, строк:", out.count(b"\n"))
           PY
           ls -l
+
+      - name: Verify kernel commit matches stock
+        run: |
+          head12=$(git rev-parse --short=12 HEAD)
+          stock12="${STOCK_REL##*-g}"
+          echo "HEAD исходников: $head12"
+          echo "Хеш в стоковом ядре: $stock12"
+          if [ -n "$STOCK_REL" ] && [ "$head12" != "$stock12" ]; then
+            echo "::warning::Коммит исходников ($head12) не совпадает со стоковым ($stock12)"
+          fi
 
       - name: Configure (stock config or defconfig, plus KernelSU)
         run: |
